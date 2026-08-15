@@ -1,0 +1,42 @@
+# Multi-stage build producing a lean standalone Next.js production image.
+FROM node:20-slim AS deps
+WORKDIR /app
+COPY frontend/package.json ./
+RUN npm install
+
+FROM node:20-slim AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY frontend/ .
+RUN npm run build
+
+FROM node:20-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    TZ=Africa/Dar_es_Salaam
+
+# See Dockerfile.backend for why (container-local time display only). This
+# image never talks to Postgres itself, but timestamps rendered client-side
+# from API data (new Date(...).toLocaleString()) use the *browser's* zone,
+# not the container's - tzdata here is purely for server-side log lines.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser
+
+# `output: 'standalone'` (next.config.mjs) traces only the dependencies
+# actually needed at runtime into .next/standalone - no full node_modules
+# copy, no dev server, no build toolchain in the final image.
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+USER appuser
+EXPOSE 3000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"
+
+CMD ["node", "server.js"]
