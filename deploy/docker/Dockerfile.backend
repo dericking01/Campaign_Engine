@@ -1,0 +1,62 @@
+# Multi-stage build: compile deps in `builder`, ship a slim runtime image.
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    librdkafka-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt .
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --default-timeout=120 --retries=10 -r requirements.txt
+
+FROM python:3.12-slim AS runtime
+
+# All business timestamps are TIMESTAMPTZ (stored UTC regardless of session
+# TZ - see docs/architecture.md), so this doesn't change what's stored; it
+# makes container-local time (log lines, any local-time display) match the
+# business's real timezone instead of defaulting to UTC. tzdata is required
+# for the TZ env var to actually resolve - without it, Python's zoneinfo and
+# libc's localtime lookups fail silently back to UTC.
+ENV TZ=Africa/Dar_es_Salaam
+
+# librdkafka (runtime, not -dev) is needed by confluent-kafka at import time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    librdkafka1 \
+    curl \
+    tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+COPY backend/app ./app
+COPY backend/migrations ./migrations
+COPY backend/alembic.ini .
+
+# Named volumes are initialized with whatever ownership this path has at
+# first mount - create it here (owned by appuser) so the runtime bind/named
+# volume mounts for import storage aren't root-owned and unwritable by the
+# non-root process below.
+RUN mkdir -p /var/lib/campaign-engine/imports/uploads && \
+    chown -R appuser:appuser /var/lib/campaign-engine
+
+USER appuser
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8000/api/v1/health || exit 1
+
+EXPOSE 8000
+
+# Production ASGI server, no --reload. Worker count is deliberately modest
+# (CPU-bound work belongs in the Python worker processes, not the API).
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
