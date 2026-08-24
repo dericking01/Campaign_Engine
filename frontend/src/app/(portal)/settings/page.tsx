@@ -1,10 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { MapPin, Pencil, Plus, RefreshCw, Trash2, Users, X, Zap } from "lucide-react";
+import { MapPin, Pencil, RefreshCw, Zap } from "lucide-react";
 import { api, ApiError } from "@/services/api";
 import { useAuth } from "@/features/auth/AuthProvider";
-import type { ChannelConfigItem, RoleDetail, UserAccount, ZoneConfig } from "@/types";
+import type { ChannelConfigItem, ZoneConfig } from "@/types";
 import { PageHeader } from "@/components/PageHeader";
 import {
   Alert,
@@ -12,10 +12,8 @@ import {
   Button,
   Card,
   CardHeader,
-  Checkbox,
   EmptyState,
   Input,
-  Select,
   Table,
   TBody,
   TD,
@@ -25,9 +23,8 @@ import {
 } from "@/components/ui";
 
 export default function SettingsPage() {
-  const { user: currentUser, can } = useAuth();
+  const { can } = useAuth();
   const [zones, setZones] = useState<ZoneConfig[] | null>(null);
-  const [roles, setRoles] = useState<RoleDetail[]>([]);
   const [channels, setChannels] = useState<ChannelConfigItem[] | null>(null);
   const [editingChannel, setEditingChannel] = useState<string | null>(null);
   const [editSenderId, setEditSenderId] = useState("");
@@ -37,93 +34,14 @@ export default function SettingsPage() {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [syncOk, setSyncOk] = useState(true);
 
-  const [users, setUsers] = useState<UserAccount[] | null>(null);
-  const [showUserForm, setShowUserForm] = useState(false);
-  const [newEmail, setNewEmail] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [newRole, setNewRole] = useState<string>("VIEWER");
-  const [newFullName, setNewFullName] = useState("");
-  const [userMessage, setUserMessage] = useState<{ text: string; tone: "success" | "error" } | null>(null);
-  const [creatingUser, setCreatingUser] = useState(false);
-  const [editingUserId, setEditingUserId] = useState<number | null>(null);
-  const [editRole, setEditRole] = useState("");
-  const [editFullName, setEditFullName] = useState("");
-  const [editActive, setEditActive] = useState(true);
-
   const refreshChannels = useCallback(() => {
     api.channels().then(setChannels).catch(() => setChannels([]));
   }, []);
 
-  const refreshUsers = useCallback(() => {
-    if (!can("user:manage")) return;
-    api.users().then(setUsers).catch(() => setUsers([]));
-    api.roles().then(setRoles).catch(() => setRoles([]));
-  }, [can]);
-
   useEffect(() => {
     api.zones().then((data) => setZones(data as ZoneConfig[])).catch(() => setZones([]));
     refreshChannels();
-    refreshUsers();
-  }, [refreshChannels, refreshUsers]);
-
-  async function onCreateUser(e: React.FormEvent) {
-    e.preventDefault();
-    setUserMessage(null);
-    if (!newEmail.trim() || newPassword.length < 8) {
-      setUserMessage({ text: "Email is required and password must be at least 8 characters.", tone: "error" });
-      return;
-    }
-    setCreatingUser(true);
-    try {
-      await api.createUser({
-        email: newEmail.trim(),
-        password: newPassword,
-        role: newRole,
-        full_name: newFullName.trim() || undefined,
-      });
-      setNewEmail("");
-      setNewPassword("");
-      setNewFullName("");
-      setNewRole("VIEWER");
-      setShowUserForm(false);
-      setUserMessage({ text: "User created.", tone: "success" });
-      refreshUsers();
-    } catch (err) {
-      setUserMessage({ text: err instanceof ApiError ? err.message : "Could not create user", tone: "error" });
-    } finally {
-      setCreatingUser(false);
-    }
-  }
-
-  function startEditUser(u: UserAccount) {
-    setEditingUserId(u.id);
-    setEditRole(u.role);
-    setEditFullName(u.full_name ?? "");
-    setEditActive(u.is_active);
-    setUserMessage(null);
-  }
-
-  async function onSaveUser(id: number) {
-    try {
-      await api.updateUser(id, { role: editRole, full_name: editFullName.trim(), is_active: editActive });
-      setEditingUserId(null);
-      setUserMessage({ text: "User updated.", tone: "success" });
-      refreshUsers();
-    } catch (err) {
-      setUserMessage({ text: err instanceof ApiError ? err.message : "Could not update user", tone: "error" });
-    }
-  }
-
-  async function onDeleteUser(id: number, email: string) {
-    setUserMessage(null);
-    try {
-      await api.deleteUser(id);
-      setUserMessage({ text: `Removed "${email}".`, tone: "success" });
-      refreshUsers();
-    } catch (err) {
-      setUserMessage({ text: err instanceof ApiError ? err.message : "Could not remove user", tone: "error" });
-    }
-  }
+  }, [refreshChannels]);
 
   function startEditChannel(c: ChannelConfigItem) {
     setEditingChannel(c.channel);
@@ -164,7 +82,7 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="System Configuration" description="Zones, channel gateway allocation, users and roles." />
+      <PageHeader title="System Configuration" description="Zones, channel gateway allocation and subscriber sync." />
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         <Card padded={false}>
@@ -295,146 +213,6 @@ export default function SettingsPage() {
         </Card>
 
       </div>
-
-      <Card padded={false} className="mt-5">
-        <div className="flex items-start justify-between p-6 pb-0">
-          <CardHeader
-            title="Users & roles"
-            description="Assign a role to each user - see the Roles &amp; Permissions page to define what each role can do. Enforced by the API on every request; this panel is ergonomics only."
-          />
-          {can("user:manage") && (
-            <Button icon={showUserForm ? <X /> : <Plus />} onClick={() => setShowUserForm((v) => !v)}>
-              {showUserForm ? "Cancel" : "Add User"}
-            </Button>
-          )}
-        </div>
-
-        {userMessage && (
-          <div className="px-6">
-            <Alert tone={userMessage.tone === "success" ? "success" : "error"} className="mb-4">
-              {userMessage.text}
-            </Alert>
-          </div>
-        )}
-
-        {showUserForm && (
-          <form onSubmit={onCreateUser} className="mb-2 grid grid-cols-1 gap-3 px-6 pb-6 sm:grid-cols-2 lg:grid-cols-4">
-            <Input label="Email" type="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} />
-            <Input
-              label="Password"
-              type="password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              hint="At least 8 characters"
-            />
-            <Input label="Full name (optional)" value={newFullName} onChange={(e) => setNewFullName(e.target.value)} />
-            <div className="flex items-end gap-2">
-              <div className="flex-1">
-                <Select label="Role" value={newRole} onChange={(e) => setNewRole(e.target.value)}>
-                  {roles.map((r) => (
-                    <option key={r.code} value={r.code}>
-                      {r.label}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <Button type="submit" loading={creatingUser} icon={<Plus />}>
-                Create
-              </Button>
-            </div>
-          </form>
-        )}
-
-        {!can("user:manage") ? (
-          <EmptyState icon={<Users />} title="Restricted" description="Your role cannot manage user accounts." />
-        ) : !users ? (
-          <div className="px-6 pb-6 text-[13.5px] text-ink-muted">Loading...</div>
-        ) : users.length === 0 ? (
-          <EmptyState icon={<Users />} title="No users yet" />
-        ) : (
-          <Table>
-            <THead>
-              <TR>
-                <TH>Email</TH>
-                <TH>Full name</TH>
-                <TH>Role</TH>
-                <TH>Status</TH>
-                <TH />
-              </TR>
-            </THead>
-            <TBody>
-              {users.map((u) =>
-                editingUserId === u.id ? (
-                  <TR key={u.id} className="bg-brand-50/60">
-                    <TD className="text-ink-muted">{u.email}</TD>
-                    <TD>
-                      <Input value={editFullName} onChange={(e) => setEditFullName(e.target.value)} />
-                    </TD>
-                    <TD>
-                      <Select value={editRole} onChange={(e) => setEditRole(e.target.value)} disabled={u.id === currentUser?.id}>
-                        {roles.map((r) => (
-                          <option key={r.code} value={r.code}>
-                            {r.label}
-                          </option>
-                        ))}
-                      </Select>
-                    </TD>
-                    <TD>
-                      <Checkbox
-                        label="Active"
-                        checked={editActive}
-                        disabled={u.id === currentUser?.id}
-                        onChange={(e) => setEditActive(e.target.checked)}
-                      />
-                    </TD>
-                    <TD>
-                      <div className="flex justify-end gap-2">
-                        <Button size="sm" onClick={() => onSaveUser(u.id)}>
-                          Save
-                        </Button>
-                        <Button size="sm" variant="ghost" onClick={() => setEditingUserId(null)}>
-                          Cancel
-                        </Button>
-                      </div>
-                    </TD>
-                  </TR>
-                ) : (
-                  <TR key={u.id}>
-                    <TD className="font-medium">
-                      {u.email}
-                      {u.id === currentUser?.id && <span className="ml-2 text-[11.5px] text-ink-faint">(you)</span>}
-                    </TD>
-                    <TD className="text-ink-muted">{u.full_name ?? "—"}</TD>
-                    <TD>
-                      <Badge tone="brand">{u.role.replace(/_/g, " ")}</Badge>
-                    </TD>
-                    <TD>
-                      <Badge tone={u.is_active ? "success" : "neutral"}>{u.is_active ? "Active" : "Inactive"}</Badge>
-                    </TD>
-                    <TD>
-                      <div className="flex justify-end gap-2">
-                        <Button size="sm" variant="ghost" icon={<Pencil />} onClick={() => startEditUser(u)}>
-                          Edit
-                        </Button>
-                        {u.id !== currentUser?.id && (
-                          <Button
-                            size="sm"
-                            variant="danger"
-                            icon={<Trash2 />}
-                            onClick={() => onDeleteUser(u.id, u.email)}
-                          >
-                            Remove
-                          </Button>
-                        )}
-                      </div>
-                    </TD>
-                  </TR>
-                )
-              )}
-            </TBody>
-          </Table>
-        )}
-      </Card>
     </>
   );
 }

@@ -15,6 +15,7 @@ import {
   History,
   Settings,
   Users,
+  UserCog,
   KeyRound,
   LogOut,
   Menu,
@@ -33,6 +34,7 @@ const NAV_ITEMS = [
   { href: "/reports", label: "Reports & Analytics", icon: BarChart3 },
   { href: "/audit", label: "Audit Log", icon: History },
   { href: "/staff", label: "Staff Directory", icon: Users },
+  { href: "/users", label: "Manage Users", icon: UserCog },
   { href: "/roles", label: "Roles & Permissions", icon: KeyRound },
   { href: "/settings", label: "System Configuration", icon: Settings },
 ];
@@ -92,13 +94,20 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
       {user && (
         <div className="shrink-0 border-t border-line p-3">
           <div className="flex items-center gap-2.5 rounded-lg px-2 py-2">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-100 text-[12px] font-semibold text-brand-800">
-              {initialsOf(user.email)}
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-[13px] font-medium text-ink">{user.email}</p>
-              <p className="text-[11.5px] text-ink-faint">{user.role.replace(/_/g, " ")}</p>
-            </div>
+            <Link
+              href="/profile"
+              onClick={onNavigate}
+              title="My Profile"
+              className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg -mx-1 px-1 py-1 transition-colors hover:bg-surface-sunken"
+            >
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-100 text-[12px] font-semibold text-brand-800">
+                {initialsOf(user.email)}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[13px] font-medium text-ink">{user.email}</p>
+                <p className="text-[11.5px] text-ink-faint">{user.role.replace(/_/g, " ")}</p>
+              </div>
+            </Link>
             <button
               onClick={logout}
               aria-label="Sign out"
