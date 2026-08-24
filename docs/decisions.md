@@ -968,6 +968,424 @@ uneditable from the portal. Replaced with two tables, `campaign.roles`
     its existing `sm:`/`lg:` grid breakpoints - both patterns already
     correct, not something this pass needed to change.
 
+## Post-Phase-7 addendum #2 — phone numbers, SMS 2FA, sliding sessions, self-service profile
+
+63. **Generic, purpose-tagged OTP table instead of three separate ones.**
+    Login 2FA, OTP-gated password change, and forgot-password all need
+    "generate a code, SMS it, verify it once" - rather than three
+    near-identical tables, one `campaign.otp_codes` table carries a
+    `purpose` column (`LOGIN_2FA` / `PASSWORD_CHANGE` / `PASSWORD_RESET`,
+    `CHECK`-constrained) plus `pending_token` (a random, unguessable
+    handle returned to the client instead of the DB row's own id),
+    `code_hash`, `expires_at`, `consumed_at`, `attempt_count`. Matches
+    this project's established pattern of reusable primitives over
+    one-off tables (e.g. `customer_subscription_state` genericized by
+    `product_code` back in Phase 2, not one table per product). The code
+    itself is never stored in plaintext - hashed via the same
+    `hash_password`/`verify_password` bcrypt helpers already used for
+    user passwords, so a DB read alone (backup, replica, careless query)
+    can't recover a live code.
+
+    **Code format** (per explicit spec: "4 digits where code has 3
+    numbers and 1 capital letter randomized"): 3 digits + 1 uppercase
+    letter, `secrets.choice` per character, then
+    `secrets.SystemRandom().shuffle` to randomize the letter's position
+    - never fixed at position 4. Verified case-insensitively on entry
+    (`code.strip().upper()`) since a phone's SMS app or the user's own
+    typing may not preserve case, without weakening the stored hash's
+    randomness.
+
+    Sent via the same `app.gateways.kannel.send()` used for every
+    campaign dispatch since Phase 5 - not a separate SMS path - but with
+    a dedicated `sender_id="AFYACALL"` (`OTP_SENDER_ID` in `.env`),
+    distinct from any campaign's sender ID, so an operator glancing at
+    an inbound SMS can immediately tell "this is a system message, not
+    a campaign".
+
+64. **Non-enumeration in forgot-password, by response shape, not by
+    hiding errors.** `POST /auth/forgot-password/request` always returns
+    the same `{pending_token}` shape whether or not the identifier
+    matches a real account: a real request calls `request_otp(...)` and
+    returns its real `pending_token`; an unmatched identifier gets a
+    freshly generated `secrets.token_urlsafe(32)` that was never written
+    to `otp_codes` and so can never successfully verify. An attacker
+    probing "does admin@afyacall.co.tz have an account" gets
+    byte-identical responses either way - the only oracle would be SMS
+    delivery timing to a phone they don't control, not the API response.
+    Verified live: both cases produce identically-shaped JSON, and the
+    dummy token was confirmed to always fail verification (never a false
+    accept).
+
+65. **Password changes are always OTP-gated, self-service or not - the
+    one deliberate exception to "2FA off means no OTP".** Per explicit
+    spec ("When user wanna change password he should confirm via OTP...
+    Yeah for security mate" and "forgot password still requires OTP
+    despite 2FA disabled"): `two_factor_enabled` only governs whether
+    *login* requires a code. `POST /auth/change-password/request` (needs
+    the current password) and `POST /auth/forgot-password/request` both
+    unconditionally require phone-based OTP confirmation regardless of
+    the account's 2FA setting - a credential-change is treated as
+    higher-risk than an ordinary login by design, not an oversight.
+
+66. **2FA defaults ON but cannot be force-enabled without a phone -
+    solves the "don't lock out the seed admin" bootstrapping problem.**
+    Spec says "By default the 2FA should be ON" - enforced as the
+    column default (`two_factor_enabled BOOLEAN DEFAULT true`) for every
+    *new* user (who always has a phone, since it's now a required field
+    on `POST /users`). But migration `0009` explicitly downgrades any
+    *existing* user with no phone on file to `two_factor_enabled=false`
+    as a one-time data fix (in practice, only the seed admin) - a
+    default of `true` with no phone would have made that account
+    unloginable the instant the migration ran. Symmetrically,
+    `PUT /auth/me/2fa` rejects `enabled=true` with 400 if the caller has
+    no phone, and the Profile page's toggle is disabled (with an
+    explanatory label) until a phone is saved - the same guarantee
+    enforced at both the API boundary and the UI, not just one.
+
+67. **Sliding 30-minute session, layered under (not replacing) the JWT's
+    own expiry.** Spec: "max session is 30m... if inactive then auto
+    logged out... if active then extend session token is auto
+    populated". Rather than reissuing JWTs on every request (which would
+    need the client to swap its stored token constantly) or trying to
+    mutate a JWT's own expiry after issuance (not possible - JWTs are
+    immutable once signed), the JWT carries a `sid` claim pointing at a
+    DB-backed `campaign.user_sessions` row, and *that row's*
+    `last_activity_at` is the real, sliding 30-minute clock
+    (`SESSION_IDLE_TIMEOUT_MINUTES` in `.env`). `get_current_user()`
+    checks `now - last_activity_at <= 30min` on every authenticated
+    request and bumps it on success - so the JWT itself can carry a long
+    outer ceiling (`JWT_ACCESS_TOKEN_EXPIRE_MINUTES=480`, bumped up from
+    60) purely as a hard backstop, while the *real* logout-on-idle
+    behavior lives entirely in the session row, decoupled from the
+    token's own crypto lifetime. Revoking a session (e.g. a future
+    "sign out other devices" feature) is just one `UPDATE`, no token
+    blocklist needed.
+
+    **A real bug caught before it shipped, not after**: `app.core.db.
+    get_db()` only does `yield db` then `db.close()` in a `finally` -
+    it never auto-commits. The session-touch `UPDATE` inside
+    `get_current_user()` was therefore part of whatever transaction the
+    endpoint itself was in, and for the *majority* of traffic (plain
+    `GET` reads, which never call `db.commit()` themselves), the
+    activity bump would be silently rolled back on `db.close()` - the
+    sliding-session mechanism would have looked correct in code and in
+    manual single-request testing, then quietly never actually extended
+    anyone's session in production. Fixed by an explicit, independent
+    `db.commit()` immediately after a successful session touch inside
+    `get_current_user()` - deliberately separate from the endpoint's own
+    business-transaction commit/rollback, so a failed business action
+    never also discards an otherwise-healthy session extension.
+
+    Verified live, not just read as correct: manually set a real
+    session's `last_activity_at` to 31 minutes in the past - the same,
+    still-cryptographically-valid JWT was then rejected with 401 "Not
+    authenticated" (proves the session clock, not the JWT's own 8-hour
+    expiry, is what actually gates access). Separately, set
+    `last_activity_at` to 25 minutes in the past, made one real
+    authenticated request, and confirmed the column jumped to within
+    68ms of actual wall-clock "now" - proving the extend-on-activity path
+    genuinely writes, not just that the read-side check works.
+
+68. **Login accepts email or phone in one field, disambiguated
+    server-side.** Spec: "User should be able to login with phone
+    number ie: 255xxxx or email." One `identifier` input;
+    `PHONE_RE = ^255[0-9]{9}$` decides server-side whether to look the
+    row up by `User.phone` or by `User.email` (lowercased) - no client-
+    side toggle or guessing needed. Verified live: a real login using
+    `255743956595` instead of the admin's email succeeded identically.
+
+69. **Admin never sees a plaintext password - for account creation *or*
+    admin-triggered resets.** Spec: "When user is created/Registered.
+    he/she receives a message with first time temporary login
+    credentials and campaign engine portal's link." `POST /users` no
+    longer accepts a `password` field at all (previously admin-supplied,
+    now impossible to supply) - the backend generates a random temporary
+    password (visually-unambiguous alphabet, excluding `0/O/1/l/I`,
+    since it's read off an SMS and typed back in) and only ever sends it
+    via the same welcome SMS as `_send_welcome_sms()`, which also
+    includes `PORTAL_URL`. A parallel `POST /users/{id}/reset-password`
+    endpoint (new - previously admin could set an arbitrary password
+    directly via `PUT /users/{id}`, now removed) applies the exact same
+    posture to admin-initiated resets: a fresh temp password generated,
+    hashed, and SMSed - the admin triggering it never sees the value,
+    matching the same "credentials are delivered, never displayed"
+    principle the OTP flows use.
+
+70. **"Manage Users" split out from "Roles & Permissions" - two
+    different jobs, two different pages.** Spec: "separate the menu item
+    of 'roles & permissions' AND 'manage users' where in manage users is
+    where you CRUD users. while the other you CRUD roles n permissions."
+    The old Settings page's combined "Users & roles" panel (Phase 6) is
+    removed entirely; user CRUD moves to a new standalone `/users` page
+    (own nav item, own `user:manage` permission gate, unchanged from
+    Phase 6) with columns this spec also asked for - phone, 2FA status,
+    last login timestamp, browser, and source IP, all already returned
+    by the existing `UserOut` schema once `last_login_at/ip/browser` were
+    added to the `users` table (set once, on every successful login, in
+    `_issue_session_and_token`). `/roles` (Post-Phase-6 addendum) needed
+    no changes - it was already a dedicated role/action-matrix page, not
+    part of this split.
+
+71. **A new self-service "My Profile" page, reachable from the sidebar
+    footer, not a new top-level nav item** - the sidebar's existing
+    user-identity row (avatar initials + email + role) became a `Link`
+    to `/profile` instead of a plain `<div>`, keeping the main nav list
+    focused on operational sections. Covers every field the spec asked
+    for in one place: name/email/phone edit (`PUT /auth/me`, no OTP -
+    matches "confirm via OTP" being specified only for password changes,
+    not profile edits), a 2FA on/off toggle (disabled without a phone,
+    per #66), and an inline OTP-gated change-password flow reusing the
+    same `OtpInput` component and auto-verify UX as login (below).
+
+72. **One shared `OtpInput` component for all three OTP entry points**
+    (login 2FA, forgot-password reset, profile change-password) - 4
+    individually-focused single-character boxes with auto-advance-on-
+    type, backspace-to-previous, and paste-splits-across-all-4 support.
+    Per explicit spec ("when user fills the OTP. it should auto verify.
+    Not untill user clicks confirm button. But also put a confirm button
+    as fallback"): the component fires `onComplete(code)` the instant
+    all 4 boxes are filled (a `firedRef` guard stops it firing twice on
+    the same value, e.g. from a paste immediately followed by a manual
+    edit), while every call site *also* renders an explicit "Confirm"
+    button wired to the same submit handler and disabled until 4
+    characters are present - genuinely a fallback path, not dead UI,
+    verified by using it directly in the live browser test below rather
+    than only relying on auto-verify.
+
+## What was verified live for phone/2FA/sessions/profile (not just designed)
+
+- Migration `0009` applied against the real production Postgres; the
+  seed admin (no phone at the time) was confirmed downgraded to
+  `two_factor_enabled=false` by the migration's data fix, not left at
+  the new column default of `true`.
+- Full login-without-2FA path exercised first (JWT decoded to confirm
+  the new `sid` claim; a real `campaign.user_sessions` row was created
+  with the caller's real IP and parsed browser name).
+- Real phone (`255743956595`, operator-confirmed test MSISDN) set on
+  the admin account via `PUT /auth/me`, 2FA enabled via
+  `PUT /auth/me/2fa` - both genuine configuration this project now
+  runs with, not test debris left behind.
+- **Known-code-hash-substitution technique**, used throughout, to drive
+  every OTP-gated endpoint through its *real* code path without a human
+  reading a physical phone's SMS inbox: compute a bcrypt hash of a
+  chosen plaintext code via the running backend's own
+  `hash_password()`, write that hash directly into the relevant
+  `otp_codes.code_hash` row via `psql`, then call the real API with the
+  matching plaintext. Exercises the entire real chain (API layer → row
+  lookup → hash compare → session/token issuance) rather than bypassing
+  it - the only thing substituted is how the tester learns the code, not
+  how the system verifies it.
+- Real SMS sends confirmed via Kannel response logging
+  (`outcome: SENT, http_status: 202`) for: a login 2FA code, a welcome
+  message on user creation, and a forgot-password code.
+- OTP failure paths all confirmed live, not assumed from code review:
+  wrong code → 401 "incorrect code"; replaying an already-consumed code
+  → 401 "this code has already been used"; `attempt_count` genuinely
+  incremented in the DB on each failed attempt, not just in memory.
+- Change-password and forgot-password both exercised end-to-end
+  (OTP request → known-code substitution → confirm → real re-login with
+  the new password succeeding), with the admin's real password restored
+  to its original value afterward in every case, including a second
+  round-trip performed during the frontend browser test below.
+- **First real-browser, UI-driven (not direct-API) verification of the
+  entire frontend surface**, via a disposable Playwright container
+  attached to the app's own Docker network with the correct Host header
+  and SNI (no header-spoofing workaround needed) - not a mock or a
+  component-level test:
+  - `/login`'s identifier field genuinely accepts "email or phone" copy,
+    not just an email field with relabeled text.
+  - Submitting 2FA-protected credentials genuinely withheld a token and
+    transitioned to the 4-box OTP UI - confirmed by observing no token
+    was stored and the URL stayed on `/login` until verification.
+  - Typing the 4th character into the OTP boxes auto-verified with zero
+    button clicks and navigated to `/` - the auto-verify path actually
+    fires, not merely present in code.
+  - `/users` (Manage Users) rendered real live data for the admin's own
+    just-completed test login: correct phone, "2FA: On", and a last-
+    login row (timestamp/browser/IP) matching that exact login, not
+    stale or placeholder values - and is a genuinely different page from
+    `/roles`, which shows the unrelated role × permission matrix.
+  - `/profile`, reached by clicking the sidebar's user-identity row,
+    showed the 2FA toggle already ON with "Codes are sent to
+    255743956595", and a working change-password section.
+  - `/forgot-password` reached its code-entry step from a real submitted
+    email, and (going beyond the minimum check) a full reset ran
+    end-to-end through the UI's own OTP boxes and password fields, with
+    the original password restored and re-verified via one final real
+    login afterward.
+  - Zero JS console errors, zero failed requests, and zero visual/layout
+    regressions observed across all 13 screenshots taken during the
+    session - including on the mobile-nav-sensitive sidebar footer link
+    added for `/profile`, which reuses the same drawer layout fixed in
+    the Post-Phase-7 addendum above (decision #62) rather than a new,
+    unverified pattern.
+
+## Post-Phase-7 addendum #3 — seeded admin phone, enforced-unique phone numbers
+
+73. **Two follow-ups from a user request after addendum #2 shipped:**
+    "seed phone 255743956595 for admin user" and "prevent duplicate
+    users' phone number."
+
+    The admin's phone/2FA had only ever been set *live*, directly
+    against this session's running database, during addendum #2's
+    verification - genuine configuration, but not reproducible from a
+    fresh deploy. `app/scripts/seed.py` now sets `phone=ADMIN_PHONE`
+    (default `255743956595`, `SEED_ADMIN_PHONE`-overridable) and
+    `two_factor_enabled=True` when creating the seed admin, and
+    backfills both onto an *existing* admin row that has no phone yet
+    (never overwrites one that's already set) - so a fresh environment
+    reaches a usable, 2FA-capable admin account without a manual live
+    API call, and re-running the idempotent seed against an
+    already-migrated production DB is still a safe no-op.
+
+    Separately - and this was a real, previously-shipped gap, not just
+    a missing nice-to-have: `app/api/routers/users.py` already caught
+    `IntegrityError` on user create/update and reported "a user with
+    this email or phone already exists," implying a DB-level uniqueness
+    guarantee that migration `0009` never actually added. Two accounts
+    could silently share one phone number - which, given phone is the
+    sole OTP delivery target, would have meant two accounts receiving
+    each other's login/password-reset codes. Migration `0010` adds
+    `UNIQUE (phone)` on `campaign.users` (a plain, non-partial unique
+    constraint is correct despite the column being nullable - Postgres
+    never treats `NULL = NULL`, so any number of phone-less accounts
+    remain unaffected).
+
+    Verified live end-to-end after rebuilding and redeploying
+    `migrate`/`backend-api`: the constraint's definition confirmed via
+    `pg_constraint`; a real `POST /users` with the admin's own phone
+    number correctly 409'd ("a user with this email or phone already
+    exists"); a real `PUT /users/{id}` attempting to change a different
+    user's phone to the admin's also 409'd ("a user with this phone
+    already exists"); a control case with a genuinely unique phone
+    succeeded (201) and was cleaned up afterward, confirming the
+    constraint blocks only real collisions, not valid creates.
+
+## Post-Phase-7 addendum #4 — idle auto-logout wasn't actually firing
+
+74. **Real bug report from the user**: "I've logged in and stayed
+    inactive (no browser activity for 35+ mins) but I wasn't auto
+    logged out, while SESSION_IDLE_TIMEOUT_MINUTES=30." Confirmed real,
+    not user error.
+
+    **Root cause**: the idle-timeout check (addendum #2, decision #67)
+    only runs inside `get_current_user()` - i.e. only when an
+    authenticated request actually arrives. The frontend's activity
+    heartbeat was deliberately built to send a request *only when there
+    had been real activity since the last tick* ("an idle user simply
+    stops sending heartbeats"), which is correct for not artificially
+    extending a session - but it also meant a genuinely idle tab sent
+    **zero** requests during the idle window, so nothing ever asked the
+    server "has this session gone stale?" The dashboard just sat there
+    showing "logged in" indefinitely; the session was correctly marked
+    stale server-side (the *next* real request would have 401'd), but
+    the browser had no way of knowing that without making one.
+
+    **Fix**: proactive client-side idle enforcement in `AuthProvider.
+    tsx`, independent of any server round-trip. The server now returns
+    `session_idle_timeout_minutes` on `GET /auth/me` (previously only
+    configured server-side, not visible to the client at all) so the
+    frontend's idle clock always matches the real configured value
+    rather than a hardcoded guess. The client tracks the timestamp of
+    the last real DOM activity event locally, and a 15-second interval
+    (plus an immediate check on tab focus/visibility-change, so a
+    laptop reopened after being suspended past the timeout logs out
+    right away instead of waiting for the next tick) compares elapsed
+    local idle time against that timeout - crossing it calls the
+    existing `logout()` directly (clears the stored token, redirects to
+    `/login`), no request needed to discover staleness. The heartbeat
+    that extends an *active* session server-side is unchanged and still
+    only pings on real activity, so this doesn't relax "genuinely idle
+    means logged out" - it just makes the logout side of that promise
+    actually happen instead of waiting on a request that may never
+    come. Also fixed a small adjacent gap while in this code: the
+    server-driven 401 path (`AUTH_EXPIRED_EVENT`) redirected to
+    `/login` but never called `clearToken()`, leaving a dead token in
+    storage for one extra (harmless but wasteful) round trip before the
+    next `/auth/me` call cleared it itself.
+
+    **Verified with a real timed browser test**, not just code review:
+    `SESSION_IDLE_TIMEOUT_MINUTES` was temporarily set to `1` (real
+    production stays at `30`) specifically so the test could run in
+    real wall-clock time rather than waiting 35+ real minutes. Logged
+    in via the real UI, confirmed the dashboard, then did a genuine
+    85-second idle wait with zero interaction of any kind (no clicks,
+    keys, navigation, or script-driven activity) while passively
+    logging every network request and console message. The tab
+    redirected itself to `/login` with a cleared token entirely on its
+    own, no interaction, somewhere between the 55-70 second mark - well
+    inside the configured ~60-75 second window (1-minute timeout plus
+    up to one 15-second check tick) - with zero console errors observed
+    throughout. The env var was then restored to `30` and confirmed via
+    a fresh `/auth/me` call.
+
+## Post-Phase-7 addendum #5 — pre-logout warning modal
+
+75. **User request following addendum #4**: "add a relevant toast message
+    popup at middle of screen with an icon. Before user is auto logged
+    out." A centered warning, not a corner toast, per "middle of
+    screen" - built as `SessionTimeoutModal` (backdrop + white card, an
+    amber alarm-clock icon, "Still there?" heading, a live per-second
+    countdown, a "Stay signed in" button and a "Sign out now" button),
+    rendered by `AuthProvider` alongside its children so it overlays
+    whichever page is current.
+
+    The idle-check interval (addendum #4) changed from a 15-second tick
+    to a 1-second tick - the warning's on-screen countdown needs to
+    visibly move, not jump in 15-second steps - and now also drives the
+    warning's appear/hide state: it shows once local idle time reaches
+    within `min(30s, idleTimeoutMs / 2)` of the real auto-logout (the
+    half-timeout cap means a short test/staging timeout still gets a
+    sensible, if brief, warning rather than the modal eating most of
+    it), and recomputes every tick rather than reading back prior React
+    state - deliberately, to avoid a stale-closure bug: this effect only
+    re-runs on `[user]`, not on every tick, so a value read out of state
+    inside the interval callback would go stale after the first
+    show/hide cycle.
+
+    No new server-side mechanism needed: the existing global
+    `mousemove`/`keydown`/`click`/`scroll`/`touchstart` activity
+    listeners already fire on a genuine click of "Stay signed in" (it's
+    a real click, on the page), so the button's handler doesn't need
+    anything beyond directly resetting the local idle clock and hiding
+    the modal - "Sign out now" just calls the existing `logout()`.
+    Letting the countdown run out with no interaction still ends in the
+    same client-side `logout()` call added in addendum #4 - the modal is
+    purely an earlier, friendlier notice layered in front of that
+    existing mechanism, not a replacement for it.
+
+    **Verified with a real, continuous timed browser test** (not
+    screenshots taken in isolation): against the account's current live
+    `SESSION_IDLE_TIMEOUT_MINUTES=1` config, landed on the dashboard,
+    then did a genuine 33-second idle wait - the modal appeared right on
+    schedule showing "26s" remaining; a further 3-second wait showed
+    "22s" (confirmed the number is a live decrementing countdown, not a
+    static string). Clicked "Stay signed in" for real, then continued
+    idling with zero further interaction: at +15s post-click, still
+    authenticated with no modal (proves the click genuinely reset the
+    clock rather than just hiding the UI); at +35s post-click (72s total
+    from the original dashboard load - well past where the *original,
+    unreset* 60-second timeout would have fired), still authenticated
+    and the warning modal had reappeared right on its own new schedule;
+    at +65s post-click, the tab had redirected itself to `/login` with a
+    cleared token entirely on its own - proving the full cycle (warn →
+    reset via user action → warn again → real auto-logout when truly
+    ignored) all work together correctly, not just each piece in
+    isolation.
+
+    Two live-state notes surfaced incidentally while testing (not
+    something this addendum caused or needed to fix): the admin
+    account's `two_factor_enabled` was found to be `false` at test time
+    (previously live-verified `true` in addendum #2/#3 - toggled off at
+    some point outside this session, most plausibly the user's own
+    interactive testing of the profile page's 2FA toggle) and
+    `SESSION_IDLE_TIMEOUT_MINUTES` remains at the shortened `1`-minute
+    value from the user's own testing rather than the documented
+    30-minute production default. Both are genuine external state, not
+    reverted by this change - flagged to the user rather than silently
+    changed back, per this session's standing practice of never
+    overwriting state the user appears to have set deliberately.
+
 ## Known follow-ups
 
 - ~~Phase 6 UI gating was verified for SUPER_ADMIN and VIEWER only, not

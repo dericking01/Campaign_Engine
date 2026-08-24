@@ -1,9 +1,9 @@
 # AfyaCall Campaign Engine — Architecture
 
-Status: Phase 1 (Foundation), Phase 2 (Ingestion), and Phase 3
-(Eligibility/DND/Subscriber) implemented and verified live - including a
-17M-row real-scale ingestion run and a precisely-constructed eligibility
-test against real subscriber data. This document is the durable reference;
+Status: Phases 1-7 implemented and verified live, plus two post-Phase-7
+addenda - most recently phone numbers, SMS 2FA, sliding sessions, and
+self-service profile management (migration 0009, see "Post-Phase-7
+addendum #2" below). This document is the durable reference;
 `/root/.claude/plans/buzzing-meandering-rocket.md` is the session's working
 plan and duplicates parts of this for history; `docs/decisions.md` has the
 full log of live verifications and bugs found.
@@ -71,9 +71,16 @@ violation during Phase 1 verification (see `docs/decisions.md`).
   `channel_configs` (per-channel sender_id/tps_allocation — fixes the legacy
   inconsistency where `drmaster.php` used `"AFYACALL"` as sender id while
   `smsmaster.php`/`ivrmaster.php` used `"15723"`), `users` (role is an FK
-  to `roles.code`, not a fixed set - see "Post-Phase-6 addendum"), `roles`
+  to `roles.code`, not a fixed set - see "Post-Phase-6 addendum"; also
+  carries `phone`, `two_factor_enabled`, and `last_login_at/ip/browser` -
+  see "Post-Phase-7 addendum #2"), `roles`
   + `role_permissions` (GUI-configurable role → `Action` grants; 5 seeded
   system roles, plus any custom ones created via the portal),
+  `otp_codes` (purpose-tagged SMS one-time-codes for login 2FA, password
+  change, and password reset), `user_sessions` (the sliding-30-minute
+  session backing each JWT's `sid` claim); `users.phone` is `UNIQUE`
+  (migration `0010`, since it's the sole OTP delivery target - two
+  accounts sharing one phone would receive each other's codes),
   `import_profiles` (reusable column-mapping templates), `customer_products`.
 - **Import pipeline**: `imports` (full import state machine), `import_staging_rows`
   (transient, per-import preview data).
@@ -470,3 +477,103 @@ Operator catch-up (migration 0006), verified live - see `docs/decisions.md`
   run-time, across every service. All business timestamps are already
   `TIMESTAMPTZ` (stored UTC regardless) - this only affects container-local
   time display (logs, etc.), not correctness or storage.
+
+## Post-Phase-7 addendum #2 — phone numbers, SMS 2FA, sliding sessions, self-service profile
+
+Migration `0009`, verified live end-to-end including a first real-browser UI
+pass - see `docs/decisions.md` #63-72 for full detail:
+
+- **Phone numbers on users** (`users.phone`, `CHECK ^255[0-9]{9}$`) are now
+  a required field on user creation and the delivery channel for every
+  security-sensitive message this addendum adds - OTPs and welcome/reset
+  credentials alike. Existing users with no phone (in practice, only the
+  seed admin) were migrated to `two_factor_enabled=false` rather than
+  left at the new default of `true`, avoiding a self-inflicted lockout.
+- **SMS 2FA on login** via a purpose-tagged `otp_codes` table
+  (`LOGIN_2FA` / `PASSWORD_CHANGE` / `PASSWORD_RESET`) rather than three
+  separate tables - same "reusable primitive" pattern as
+  `customer_subscription_state`'s `product_code` column. Codes are 3
+  digits + 1 uppercase letter at a random position
+  (`app.services.otp_service._generate_code`), hashed with the same
+  bcrypt helpers as user passwords, sent via the existing
+  `app.gateways.kannel.send()` dispatch path with a dedicated
+  `OTP_SENDER_ID="AFYACALL"`. `two_factor_enabled` gates *login* OTP
+  only - password change and forgot-password always require OTP
+  regardless of that setting, since a credential change is treated as
+  higher-risk than an ordinary login.
+- **Sliding 30-minute sessions** (`SESSION_IDLE_TIMEOUT_MINUTES`), layered
+  under a longer JWT ceiling (`JWT_ACCESS_TOKEN_EXPIRE_MINUTES=480`) rather
+  than replacing it: the JWT carries a `sid` claim into a DB-backed
+  `user_sessions` row, and that row's `last_activity_at` - not the JWT's
+  own expiry - is what `get_current_user()` actually checks and extends
+  on every request. Caught and fixed a real bug pre-ship: `get_db()`
+  never auto-commits, so the session-touch update needs its own explicit
+  `db.commit()` independent of the endpoint's business transaction, or it
+  silently rolls back on every plain `GET`. Verified live by manually
+  aging a session past 30 minutes (rejected despite a still-valid JWT)
+  and by aging one to 25 minutes then confirming one real request bumped
+  `last_activity_at` to within 68ms of wall-clock now.
+- **Non-enumerating forgot-password**: `POST /auth/forgot-password/request`
+  always returns the same response shape whether or not the identifier
+  matches a real account - a dummy `pending_token` is generated for
+  unmatched identifiers that can never successfully verify, so there's no
+  API-response oracle for account discovery.
+- **Login accepts email or phone** in a single identifier field,
+  disambiguated server-side by `^255[0-9]{9}$`.
+- **Admin never sees a plaintext password**: `POST /users` no longer
+  accepts a client-supplied password at all - a temp password is
+  generated server-side and delivered only via welcome SMS (with
+  `PORTAL_URL`); a new `POST /users/{id}/reset-password` applies the same
+  posture to admin-triggered resets.
+- **"Manage Users" split from "Roles & Permissions"** into two dedicated
+  portal pages/nav items - the former is user CRUD plus new
+  phone/2FA-status/last-login (timestamp, browser, IP) columns; the
+  latter (unchanged from the Post-Phase-6 addendum) is the role → action
+  matrix. A new self-service `/profile` page (reached from the sidebar's
+  user-identity row) covers name/email/phone edits, the 2FA toggle
+  (disabled without a phone), and an OTP-gated change-password flow.
+- **One shared `OtpInput` frontend component** (4 auto-advancing,
+  auto-verify-on-completion boxes, plus an explicit Confirm-button
+  fallback) reused across login 2FA, forgot-password, and profile
+  change-password - verified in a real browser (a disposable Playwright
+  container on the app's own Docker network, correct Host header/SNI, no
+  mocking) rather than only at the component level: the 2FA step
+  genuinely withholds a token until verified, the 4th typed character
+  genuinely auto-submits with zero clicks, and `/users` genuinely renders
+  a just-completed login's real last-login/browser/IP data.
+
+## Post-Phase-7 addendum #4 — idle auto-logout enforced client-side too
+
+A genuinely idle tab sends no requests at all, so the server-side idle
+check inside `get_current_user()` (addendum #2 above) never got a chance
+to run - "auto logged out after N minutes idle" silently never fired for
+a truly inactive tab. Fixed by adding a client-side idle timer to
+`AuthProvider.tsx`: `GET /auth/me` now also returns
+`session_idle_timeout_minutes` (previously server-only config), and the
+frontend independently tracks elapsed local idle time, forcing a logout
+the moment it crosses that value - no request needed to discover the
+session had gone stale. Verified with a real ~85-second timed browser
+test against a temporarily-shortened 1-minute timeout (restored to 30
+afterward): the tab redirected itself to `/login` with a cleared token,
+zero interaction, well inside the expected window. See
+`docs/decisions.md` #74.
+
+## Post-Phase-7 addendum #5 — pre-logout warning modal
+
+`SessionTimeoutModal` (centered backdrop + card, amber alarm-clock icon,
+live countdown, "Stay signed in" / "Sign out now") appears once local idle
+time reaches within `min(30s, idleTimeoutMs / 2)` of the real auto-logout
+added in addendum #4 - a friendlier notice layered in front of that
+existing mechanism, not a replacement for it. The idle-check interval
+moved from 15s to 1s ticks so the countdown visibly moves; state is always
+recomputed on each tick rather than read back from React state, to avoid a
+stale-closure bug in an effect that only re-runs on `[user]`. "Stay signed
+in" resets the local idle clock (a real click already extends it via the
+existing activity listeners) and hides the modal; ignoring it still ends
+in the same `logout()` from addendum #4. Verified with one continuous
+timed browser test covering the full cycle - warning appears with a
+genuinely decrementing countdown, "Stay signed in" provably resets the
+clock (confirmed still-authenticated well past where the original,
+un-reset timeout would have fired), the warning reappears on its own new
+schedule, and full auto-logout still fires when truly ignored. See
+`docs/decisions.md` #75.
