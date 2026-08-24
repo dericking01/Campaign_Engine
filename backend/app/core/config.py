@@ -54,7 +54,22 @@ class Settings(BaseSettings):
     # --- Auth ---
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 60
+    # The JWT's own cryptographic expiry - a generous outer ceiling, not
+    # the real session-length enforcement. That's session_idle_timeout_minutes
+    # below (a sliding window checked on every request) - see
+    # app.services.session_service.
+    jwt_access_token_expire_minutes: int = 480
+
+    # --- Sessions (sliding inactivity timeout) ---
+    session_idle_timeout_minutes: int = 30
+
+    # --- 2FA / OTP (SMS, same Kannel gateway as campaign dispatch) ---
+    otp_sender_id: str = "AFYACALL"
+    otp_expiry_minutes: int = 5
+    otp_max_attempts: int = 5
+
+    # --- Portal link included in welcome/reset SMS ---
+    portal_url: str = "https://simba.afyacall.co.tz"
 
     # --- Server-side import drop path (operator-controlled, manual trigger only) ---
     server_drop_path: str = "/data/campaign/incoming"
