@@ -18,11 +18,17 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
     return _pwd_context.verify(plain_password, password_hash)
 
 
-def create_access_token(subject: str, role: str) -> str:
+def create_access_token(subject: str, role: str, session_token: str) -> str:
+    """`exp` is the JWT's own crypto-expiry ceiling (generous, see
+    settings.jwt_access_token_expire_minutes) - the real session length
+    enforcement is the sliding `sid` lookup in app.core.deps.
+    get_current_user (app.services.session_service.touch_session), which
+    can invalidate this token long before `exp` if the session goes
+    idle."""
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.jwt_access_token_expire_minutes
     )
-    payload: dict[str, Any] = {"sub": subject, "role": role, "exp": expire}
+    payload: dict[str, Any] = {"sub": subject, "role": role, "sid": session_token, "exp": expire}
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
