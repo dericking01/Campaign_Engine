@@ -12,6 +12,7 @@ models as normal.
 from app.models.analytics import AnalyticsRollup
 from app.models.audience import AudienceMember, AudienceSnapshot
 from app.models.audit import AuditLog
+from app.models.auth import OtpCode, UserSession
 from app.models.base import Base
 from app.models.bases import BaseMember, BaseVersion, CampaignBase
 from app.models.campaigns import (
@@ -63,4 +64,6 @@ __all__ = [
     "Role",
     "RolePermission",
     "AnalyticsRollup",
+    "OtpCode",
+    "UserSession",
 ]
