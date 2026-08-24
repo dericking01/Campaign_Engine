@@ -9,7 +9,17 @@ export interface CurrentUser {
   email: string;
   role: Role;
   full_name: string | null;
+  phone: string | null;
+  two_factor_enabled: boolean;
   permissions: string[];
+  session_idle_timeout_minutes: number;
+}
+
+export interface LoginResult {
+  requires_otp: boolean;
+  pending_token: string | null;
+  access_token: string | null;
+  token_type: string;
 }
 
 export interface CampaignBaseSummary {
@@ -178,7 +188,12 @@ export interface UserAccount {
   email: string;
   role: Role;
   full_name: string | null;
+  phone: string | null;
   is_active: boolean;
+  two_factor_enabled: boolean;
+  last_login_at: string | null;
+  last_login_ip: string | null;
+  last_login_browser: string | null;
 }
 
 export interface RoleDetail {

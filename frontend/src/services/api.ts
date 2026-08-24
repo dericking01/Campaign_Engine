@@ -22,6 +22,7 @@ import type {
   ConversionResult,
   ImportPreview,
   ImportSummary,
+  LoginResult,
   MessageStatusSummary,
   RateLimitStatus,
   ReadyCheck,
@@ -68,6 +69,48 @@ export const api = {
   health: () => apiFetch<{ status: string }>("/health"),
   ready: () => apiFetch<ReadyCheck>("/ready"),
   me: () => apiFetch<CurrentUser>("/auth/me"),
+
+  updateProfile: (patch: { full_name?: string; email?: string; phone?: string }) =>
+    apiFetch<CurrentUser>("/auth/me", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+
+  updateTwoFactor: (enabled: boolean) =>
+    apiFetch<{ two_factor_enabled: boolean }>("/auth/me/2fa", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+
+  requestPasswordChange: (currentPassword: string) =>
+    apiFetch<{ pending_token: string }>("/auth/change-password/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: currentPassword }),
+    }),
+
+  confirmPasswordChange: (pendingToken: string, code: string, newPassword: string) =>
+    apiFetch<{ detail: string }>("/auth/change-password/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pending_token: pendingToken, code, new_password: newPassword }),
+    }),
+
+  forgotPasswordRequest: (identifier: string) =>
+    apiFetch<{ pending_token: string }>("/auth/forgot-password/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier }),
+    }),
+
+  forgotPasswordReset: (pendingToken: string, code: string, newPassword: string) =>
+    apiFetch<{ detail: string }>("/auth/forgot-password/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pending_token: pendingToken, code, new_password: newPassword }),
+    }),
   bases: () => apiFetch("/bases"),
   baseVersions: (baseId: number) => apiFetch(`/bases/${baseId}/versions`),
   campaigns: () => apiFetch<CampaignSummary[]>("/campaigns"),
@@ -103,7 +146,7 @@ export const api = {
 
   users: () => apiFetch<UserAccount[]>("/users"),
 
-  createUser: (payload: { email: string; password: string; role: string; full_name?: string }) =>
+  createUser: (payload: { email: string; phone: string; role: string; full_name?: string }) =>
     apiFetch<UserAccount>("/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -112,13 +155,15 @@ export const api = {
 
   updateUser: (
     id: number,
-    patch: { role?: string; full_name?: string; is_active?: boolean; password?: string }
+    patch: { role?: string; full_name?: string; phone?: string; is_active?: boolean }
   ) =>
     apiFetch<UserAccount>(`/users/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     }),
+
+  resetUserPassword: (id: number) => apiFetch<UserAccount>(`/users/${id}/reset-password`, { method: "POST" }),
 
   deleteUser: (id: number) => apiFetch<void>(`/users/${id}`, { method: "DELETE" }),
 
@@ -248,17 +293,37 @@ export const api = {
     }),
 };
 
-export async function login(email: string, password: string, remember = true): Promise<void> {
-  const body = new URLSearchParams({ username: email, password });
+// Step 1: email-or-phone + password. Returns either a real token
+// (requires_otp: false - 2FA off or no phone on file) or a pending_token
+// the caller must pass to verifyLoginOtp - the token is NOT stored yet
+// in the requires_otp case, since no real session exists until the code
+// is verified.
+export async function login(identifier: string, password: string, remember = true): Promise<LoginResult> {
+  const body = new URLSearchParams({ username: identifier, password });
   const res = await fetch(`${API_PREFIX}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
     throw new ApiError(res.status, data.detail ?? "Login failed");
   }
-  const data = await res.json();
+  if (!data.requires_otp) {
+    setToken(data.access_token, remember);
+  }
+  return data;
+}
+
+export async function verifyLoginOtp(pendingToken: string, code: string, remember: boolean): Promise<void> {
+  const res = await fetch(`${API_PREFIX}/auth/login/verify-otp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pending_token: pendingToken, code }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ApiError(res.status, data.detail ?? "Verification failed");
+  }
   setToken(data.access_token, remember);
 }
