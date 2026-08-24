@@ -1,7 +1,10 @@
-"""Idempotent dev/demo seed data: one SUPER_ADMIN user, the 3 channel
-configs (with the confirmed placeholder TPS split - see docs/decisions.md
-item 3), and a starter zone list matching the requirements doc's own
-audience-preview example (South/Lake/Central/Northern).
+"""Idempotent dev/demo seed data: one SUPER_ADMIN user (with a real phone
+on file and 2FA on, so a fresh environment can actually complete login -
+see docs/decisions.md #66 on why 2FA can't be forced on without a phone),
+the 3 channel configs (with the confirmed placeholder TPS split - see
+docs/decisions.md item 3), and a starter zone list matching the
+requirements doc's own audience-preview example (South/Lake/Central/
+Northern).
 
 Safe to re-run: every insert is ON CONFLICT DO NOTHING/UPDATE keyed on a
 natural unique column, never a blind INSERT.
@@ -22,6 +25,7 @@ logger = get_logger(component="seed")
 
 ADMIN_EMAIL = os.environ.get("SEED_ADMIN_EMAIL", "admin@afyacall.co.tz")
 ADMIN_PASSWORD = os.environ.get("SEED_ADMIN_PASSWORD", "ChangeMe123!")
+ADMIN_PHONE = os.environ.get("SEED_ADMIN_PHONE", "255743956595")
 
 ZONES = ["SOUTH", "LAKE", "CENTRAL", "NORTHERN"]
 
@@ -36,16 +40,26 @@ CHANNELS = [
 def run() -> None:
     db = SessionLocal()
     try:
-        if not db.query(User).filter(User.email == ADMIN_EMAIL).first():
+        admin = db.query(User).filter(User.email == ADMIN_EMAIL).first()
+        if admin is None:
             db.add(
                 User(
                     email=ADMIN_EMAIL,
                     password_hash=hash_password(ADMIN_PASSWORD),
                     role="SUPER_ADMIN",
-                    full_name="Seed Admin",
+                    full_name="Derrick Kamara",
+                    phone=ADMIN_PHONE,
+                    two_factor_enabled=True,
                 )
             )
             logger.info("seed.admin_created", email=ADMIN_EMAIL)
+        elif admin.phone is None:
+            # Backfill for a pre-existing admin row created before phone/2FA
+            # existed (migration 0009) - matches this script's "safe to
+            # re-run" idempotency, never overwrites a phone already set.
+            admin.phone = ADMIN_PHONE
+            admin.two_factor_enabled = True
+            logger.info("seed.admin_phone_backfilled", email=ADMIN_EMAIL)
         else:
             logger.info("seed.admin_already_exists", email=ADMIN_EMAIL)
 
