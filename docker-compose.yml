@@ -101,7 +101,12 @@ services:
   migrate:
     build: *backend-build
     env_file: .env
-    entrypoint: ["/opt/venv/bin/python", "-m", "alembic", "upgrade", "head"]
+    # Schema first, then the idempotent production bootstrap (initial
+    # SUPER_ADMIN from SUPER_* env vars + required channel_configs rows).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - /opt/venv/bin/python -m alembic upgrade head && /opt/venv/bin/python -m app.scripts.bootstrap
     working_dir: /app
     networks: [campaign-net]
     restart: "no"

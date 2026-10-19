@@ -27,14 +27,17 @@ host gateway) is a downstream target, never containerized here.
    ```bash
    cp .env.example .env
    # fill in POSTGRES_PASSWORD (the campaign_app password from step 1),
-   # KANNEL_USERNAME/PASSWORD, and a random JWT_SECRET_KEY.
+   # KANNEL_USERNAME/PASSWORD, a random JWT_SECRET_KEY, and the
+   # SUPER_USERNAME/EMAIL/PASSWORD/PHONE initial admin.
    ```
 3. **Bring up the stack**:
    ```bash
    docker compose up -d --build
    ```
    This builds and starts: `redis`, `kafka` (KRaft), `kafka-init` (topic
-   bootstrap), `migrate` (Alembic, creates `campaign.*`), `backend-api`,
+   bootstrap), `migrate` (Alembic creates `campaign.*`, then
+   `app.scripts.bootstrap` creates the SUPER_ADMIN and the SMS/IVR/DOCTOR
+   `channel_configs` rows; both idempotent), `backend-api`,
    `frontend`, `nginx`, and 11 worker containers (Phase 1: stub loops that
    prove connectivity + heartbeat; real logic lands Phase 2 onward).
 4. **Verify**:
@@ -42,6 +45,21 @@ host gateway) is a downstream target, never containerized here.
    - `https://simba.afyacall.co.tz:5674/api/v1/health` — liveness
    - `https://simba.afyacall.co.tz:5674/api/v1/ready` — dependency status
    - `https://simba.afyacall.co.tz:5674/api/v1/docs` — OpenAPI docs
+
+### New environments
+
+Always let `migrate` build the `campaign` schema from empty. **Never** clone
+an environment with a schema-only `pg_dump`: it copies every table but leaves
+`campaign.alembic_version` empty and drops the seed rows migrations insert
+(0007's roles), so Alembic tries to re-run 0001 and the app has no roles.
+`migrations/env.py` now refuses to run in that state with an explanatory
+error. If you hit it on a schema you've verified matches revision `<rev>`:
+`alembic -x allow_unversioned=1 stamp <rev>`, re-insert that revision's seed
+rows, then redeploy. To copy *data* between environments, dump schema and
+data together (including `campaign.alembic_version`).
+
+`app.scripts.seed` is dev/demo data only (default password, demo zones) and
+refuses to run when `ENVIRONMENT=production`.
 
 ## Local backend development (without Docker)
 

@@ -56,7 +56,7 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-class LoginResponse(BaseModel):
+class LoginResponse(BaseModel): 
     requires_otp: bool
     pending_token: str | None = None
     access_token: str | None = None

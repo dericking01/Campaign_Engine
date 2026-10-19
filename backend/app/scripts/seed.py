@@ -14,6 +14,7 @@ Usage: python -m app.scripts.seed
 
 import os
 
+from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.core.logging import configure_logging, get_logger
 from app.core.security import hash_password
@@ -38,6 +39,9 @@ CHANNELS = [
 
 
 def run() -> None:
+    # Default credentials + demo rows - production uses app.scripts.bootstrap.
+    if get_settings().environment == "production":
+        raise SystemExit("app.scripts.seed is dev/demo only; use app.scripts.bootstrap in production")
     db = SessionLocal()
     try:
         admin = db.query(User).filter(User.email == ADMIN_EMAIL).first()

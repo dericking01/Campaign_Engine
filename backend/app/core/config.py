@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     otp_expiry_minutes: int = 5
     otp_max_attempts: int = 5
 
+    # --- Initial SUPER_ADMIN (created once by app.scripts.bootstrap; login is
+    # by email or phone - super_username is stored as the display name) ---
+    super_username: str | None = None
+    super_email: str | None = None
+    super_password: str | None = None
+    super_phone: str | None = None
+
     # --- Portal link included in welcome/reset SMS ---
     portal_url: str = "https://simba.afyacall.co.tz"
 
